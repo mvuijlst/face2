@@ -7,50 +7,82 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 from PIL import Image, ImageTk, ImageOps
-import json
+import sqlite3
 from imutils import face_utils
 
 # Initialize Dlib's face detector and predictor
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+try:
+    predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+except RuntimeError:
+    messagebox.showerror("Error", "Shape predictor file not found!")
+    quit()
 
-CONFIG_FILE = "app_config.json"
-EYE_POSITIONS_FILE = "eye_positions.json"
+DB_FILE = "app_data.db"
 
-# Helper function to load configuration from JSON
+# Initialize SQLite database and create tables
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # Create table for configuration
+    c.execute('''CREATE TABLE IF NOT EXISTS config
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+    
+    # Create table for storing eye positions
+    c.execute('''CREATE TABLE IF NOT EXISTS eye_positions
+                 (filename TEXT PRIMARY KEY, left_pupil_x INTEGER, left_pupil_y INTEGER, 
+                  right_pupil_x INTEGER, right_pupil_y INTEGER)''')
+    
+    conn.commit()
+    conn.close()
+
+# Helper function to load configuration from SQLite
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as file:
-            return json.load(file)
-    return {}
+    config = {}
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT key, value FROM config")
+    for key, value in c.fetchall():
+        config[key] = value
+    conn.close()
+    return config
 
-# Helper function to save configuration to JSON
+# Helper function to save configuration to SQLite
 def save_config(config):
-    with open(CONFIG_FILE, 'w') as file:
-        json.dump(config, file)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    for key, value in config.items():
+        c.execute("REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
 
-# Helper function to load saved eye positions from JSON
+# Helper function to load saved eye positions from SQLite
 def load_eye_positions():
-    if os.path.exists(EYE_POSITIONS_FILE):
-        with open(EYE_POSITIONS_FILE, 'r') as file:
-            return json.load(file)
-    return {}
+    eye_positions = {}
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT filename, left_pupil_x, left_pupil_y, right_pupil_x, right_pupil_y FROM eye_positions")
+    for row in c.fetchall():
+        filename, left_x, left_y, right_x, right_y = row
+        eye_positions[filename] = [(left_x, left_y), (right_x, right_y)]
+    conn.close()
+    return eye_positions
 
-# Helper function to save eye positions to JSON
-def save_eye_positions(eye_positions):
-    with open(EYE_POSITIONS_FILE, 'w') as file:
-        serializable_eye_positions = {
-            filename: [[int(pupil[0]), int(pupil[1])] for pupil in pupils]
-            for filename, pupils in eye_positions.items()
-        }
-        json.dump(serializable_eye_positions, file)
-
+# Helper function to save eye positions to SQLite
+def save_eye_positions(filename, left_pupil, right_pupil):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''REPLACE INTO eye_positions (filename, left_pupil_x, left_pupil_y, right_pupil_x, right_pupil_y) 
+                 VALUES (?, ?, ?, ?, ?)''', (filename, left_pupil[0], left_pupil[1], right_pupil[0], right_pupil[1]))
+    conn.commit()
+    conn.close()
 
 # Load all images from a folder and sort by modified date
 def load_images(folder):
     images = []
     for filename in os.listdir(folder):
-        if filename.endswith((".jpg", ".png", ".jpeg")):
+        if filename.lower().endswith((".jpg", ".png", ".jpeg")):
             file_path = os.path.join(folder, filename)
             img = cv2.imread(file_path)
             if img is not None:
@@ -137,7 +169,6 @@ class EyeReviewApp:
             self.master.geometry(config['window_size'])
 
         # Load previously selected folder from config
-        config = load_config()
         self.folder_path = config.get('last_folder', None)
 
         if not self.folder_path or not os.path.exists(self.folder_path):
@@ -183,9 +214,9 @@ class EyeReviewApp:
 
     # Populate the listbox with file names (initially without detection status)
     def populate_listbox(self):
-        for filename, _, _ in self.images:
+        for idx, (filename, _, _) in enumerate(self.images):
             if filename in self.eye_positions:
-                self.listbox.insert(tk.END, f"{filename} ⚙️")
+                self.listbox.insert(tk.END, f"{filename} ✅")
             else:
                 self.listbox.insert(tk.END, f"{filename} ⏳")
 
@@ -194,10 +225,9 @@ class EyeReviewApp:
         for idx, (filename, image, _) in enumerate(self.images):
             if filename not in self.eye_positions:
                 left_pupil, right_pupil = detect_pupils_with_preprocessing(image)
-                
                 if left_pupil != (0, 0) and right_pupil != (0, 0):
+                    save_eye_positions(filename, left_pupil, right_pupil)
                     self.eye_positions[filename] = [left_pupil, right_pupil]
-                    save_eye_positions(self.eye_positions)
                     self.update_listbox_item(idx, filename, True)
                 else:
                     self.update_listbox_item(idx, filename, False)
@@ -270,10 +300,11 @@ class EyeReviewApp:
 
         if len(self.clicks) == 2:
             left_pupil, right_pupil = self.clicks
-            self.eye_positions[self.images[self.current_image_index][0]] = [left_pupil, right_pupil]
-            self.display_image(self.images[self.current_image_index][1], self.eye_positions[self.images[self.current_image_index][0]])
-            save_eye_positions(self.eye_positions)
-            self.update_listbox_item(self.current_image_index, self.images[self.current_image_index][0], True)
+            filename = self.images[self.current_image_index][0]
+            save_eye_positions(filename, left_pupil, right_pupil)
+            self.eye_positions[filename] = [left_pupil, right_pupil]
+            self.display_image(self.images[self.current_image_index][1], self.eye_positions[filename])
+            self.update_listbox_item(self.current_image_index, filename, True)
             self.clicks = []
 
     # Handle window close to save size, position, and last folder
@@ -287,6 +318,7 @@ class EyeReviewApp:
 
 # Run the application
 if __name__ == "__main__":
+    init_db()
     root = tk.Tk()
     app = EyeReviewApp(root)
     root.mainloop()
