@@ -5,10 +5,12 @@ import numpy as np
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import ttk
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk, ExifTags
 import sqlite3
 from imutils import face_utils
+import platform
+import datetime
+import tkinter.ttk as ttk  # For progress bar
 
 # Initialize Dlib's face detector and predictor
 detector = dlib.get_frontal_face_detector()
@@ -20,24 +22,49 @@ except RuntimeError:
 
 DB_FILE = "app_data.db"
 
+# Function to extract date/time from EXIF metadata
+def get_image_datetime(file_path):
+    try:
+        img = Image.open(file_path)
+        exif_data = img._getexif()
+        if exif_data is not None:
+            exif = {
+                ExifTags.TAGS.get(tag, tag): value
+                for tag, value in exif_data.items()
+            }
+            datetime_original = exif.get('DateTimeOriginal')
+            if datetime_original:
+                datetime_obj = datetime.datetime.strptime(datetime_original, '%Y:%m:%d %H:%M:%S')
+                return datetime_obj
+    except Exception as e:
+        print(f"Error reading EXIF data from {file_path}: {e}")
+    return None
+
 # Initialize SQLite database and create tables
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
+
     # Create table for configuration
     c.execute('''CREATE TABLE IF NOT EXISTS config
                  (key TEXT PRIMARY KEY, value TEXT)''')
-    
+
     # Create table for storing eye positions
     c.execute('''CREATE TABLE IF NOT EXISTS eye_positions
-                 (filename TEXT PRIMARY KEY, left_pupil_x INTEGER, left_pupil_y INTEGER, 
+                 (filename TEXT PRIMARY KEY,
+                  left_pupil_x INTEGER, left_pupil_y INTEGER,
                   right_pupil_x INTEGER, right_pupil_y INTEGER)''')
-    
+
+    # Check if datetime_taken column exists
+    c.execute("PRAGMA table_info(eye_positions)")
+    columns = [info[1] for info in c.fetchall()]
+    if 'datetime_taken' not in columns:
+        c.execute("ALTER TABLE eye_positions ADD COLUMN datetime_taken TEXT")
+
     conn.commit()
     conn.close()
 
-# Helper function to load configuration from SQLite
+# Helper functions for loading/saving configurations and eye positions
 def load_config():
     config = {}
     conn = sqlite3.connect(DB_FILE)
@@ -48,7 +75,6 @@ def load_config():
     conn.close()
     return config
 
-# Helper function to save configuration to SQLite
 def save_config(config):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -57,43 +83,66 @@ def save_config(config):
     conn.commit()
     conn.close()
 
-# Helper function to load saved eye positions from SQLite
 def load_eye_positions():
     eye_positions = {}
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT filename, left_pupil_x, left_pupil_y, right_pupil_x, right_pupil_y FROM eye_positions")
+    c.execute('''SELECT filename, left_pupil_x, left_pupil_y,
+                 right_pupil_x, right_pupil_y, datetime_taken FROM eye_positions''')
     for row in c.fetchall():
-        filename, left_x, left_y, right_x, right_y = row
-        eye_positions[filename] = [(left_x, left_y), (right_x, right_y)]
+        filename, left_x, left_y, right_x, right_y, datetime_taken = row
+        # Ensure that coordinates are integers
+        left_x = int(left_x)
+        left_y = int(left_y)
+        right_x = int(right_x)
+        right_y = int(right_y)
+        # Convert datetime string to datetime object
+        if datetime_taken:
+            datetime_taken = datetime.datetime.strptime(datetime_taken, '%Y-%m-%d %H:%M:%S')
+        else:
+            datetime_taken = None
+        eye_positions[filename] = {
+            'pupils': [(left_x, left_y), (right_x, right_y)],
+            'datetime_taken': datetime_taken
+        }
     conn.close()
     return eye_positions
 
-# Helper function to save eye positions to SQLite
-def save_eye_positions(filename, left_pupil, right_pupil):
+def save_eye_positions(filename, left_pupil, right_pupil, datetime_taken):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''REPLACE INTO eye_positions (filename, left_pupil_x, left_pupil_y, right_pupil_x, right_pupil_y) 
-                 VALUES (?, ?, ?, ?, ?)''', (filename, left_pupil[0], left_pupil[1], right_pupil[0], right_pupil[1]))
+    # Store coordinates as integers and date/time as string
+    datetime_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S') if datetime_taken else None
+    c.execute('''REPLACE INTO eye_positions (filename, left_pupil_x, left_pupil_y,
+                 right_pupil_x, right_pupil_y, datetime_taken)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (filename, int(left_pupil[0]), int(left_pupil[1]),
+               int(right_pupil[0]), int(right_pupil[1]), datetime_str))
     conn.commit()
     conn.close()
 
-# Load all images from a folder and sort by modified date
+# Load all images from a folder and sort by date/time taken
 def load_images(folder):
     images = []
     for filename in os.listdir(folder):
         if filename.lower().endswith((".jpg", ".png", ".jpeg")):
             file_path = os.path.join(folder, filename)
-            img = cv2.imread(file_path)
-            if img is not None:
-                mod_time = os.path.getmtime(file_path)
-                images.append((filename, img, mod_time))
+            img_cv = cv2.imread(file_path)
+            if img_cv is not None:
+                # Extract date/time from EXIF metadata
+                datetime_taken = get_image_datetime(file_path)
+                # If EXIF data is not available, use file modification time
+                if datetime_taken is None:
+                    mod_time = os.path.getmtime(file_path)
+                    datetime_taken = datetime.datetime.fromtimestamp(mod_time)
+                images.append((filename, img_cv, datetime_taken))
             else:
                 print(f"Skipping file {filename} due to loading error.")
+    # Sort images by date/time taken
     images.sort(key=lambda x: x[2])
     return images
 
-# Detect pupils in the largest face
+# Pupil detection functions
 def detect_pupils_with_preprocessing(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     faces = detector(gray, 1)
@@ -163,6 +212,12 @@ class EyeReviewApp:
         self.master = master
         self.master.title("Eye Detection Review")
 
+        # Determine operating system
+        self.os_name = platform.system()
+        self.is_windows = self.os_name == 'Windows'
+        self.is_mac = self.os_name == 'Darwin'
+        self.is_linux = self.os_name == 'Linux'
+
         # Load window position and size
         config = load_config()
         if 'window_size' in config:
@@ -187,125 +242,375 @@ class EyeReviewApp:
         self.current_image_index = None
         self.clicks = []
 
+        # Scale factor for zooming
+        self.zoom_scale = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+
+        # Variables to handle panning
+        self.is_panning = False
+        self.pan_start_x = 0
+        self.pan_start_y = 0
+
         # Left pane - Listbox for image list with detection status
         self.listbox_frame = tk.Frame(master)
-        self.listbox_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
+        self.listbox_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
 
-        self.listbox = tk.Listbox(self.listbox_frame, width=30, height=20)
-        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.listbox = tk.Listbox(self.listbox_frame, width=50, height=20)
+        self.listbox.pack(side=tk.LEFT, fill=tk.Y, expand=True)
         self.listbox.bind("<<ListboxSelect>>", self.on_image_select)
+
+        # Ensure the listbox can scroll with the mouse wheel
+        self.listbox.bind("<MouseWheel>", lambda event: self.on_listbox_scroll(event))
+        self.listbox.bind("<Button-4>", lambda event: self.on_listbox_scroll(event))  # Linux scroll up
+        self.listbox.bind("<Button-5>", lambda event: self.on_listbox_scroll(event))  # Linux scroll down
+
+        # Add scrollbar to listbox
+        self.scrollbar = tk.Scrollbar(self.listbox_frame, orient=tk.VERTICAL)
+        self.scrollbar.config(command=self.listbox.yview)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.config(yscrollcommand=self.scrollbar.set)
 
         # Right pane - Canvas for displaying images
         self.canvas_frame = tk.Frame(master)
-        self.canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self.canvas = tk.Canvas(self.canvas_frame, width=600, height=600)
+        self.canvas = tk.Canvas(self.canvas_frame, bg="gray")
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
+        self.canvas.bind("<Enter>", lambda event: self.canvas.focus_set())
+        self.canvas.bind("<Leave>", lambda event: self.canvas.focus_set())
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)  # Windows and macOS
+        self.canvas.bind("<Button-4>", self.on_mouse_wheel)    # Linux scroll up
+        self.canvas.bind("<Button-5>", self.on_mouse_wheel)    # Linux scroll down
 
-        # Populate listbox with file names
+        # Navigation buttons frame
+        nav_frame = tk.Frame(master)
+        nav_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.prev_button = tk.Button(nav_frame, text="Previous", command=self.show_previous_image)
+        self.prev_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.next_button = tk.Button(nav_frame, text="Next", command=self.show_next_image)
+        self.next_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Add status label and progress bar
+        self.status_label = tk.Label(master, text="Ready")
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.progress = ttk.Progressbar(master, orient=tk.HORIZONTAL, length=100, mode='determinate')
+        self.progress.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Populate listbox with file names and dates
         self.populate_listbox()
 
         # Start background processing for pupil detection
         threading.Thread(target=self.process_images_in_background, daemon=True).start()
 
+        # Bind arrow keys for navigation
+        self.master.bind('<Left>', lambda event: self.show_previous_image())
+        self.master.bind('<Right>', lambda event: self.show_next_image())
+        self.master.bind('<Up>', lambda event: self.show_previous_image())
+        self.master.bind('<Down>', lambda event: self.show_next_image())
+
         # Save window size and position on close
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # Populate the listbox with file names (initially without detection status)
+    # Handle listbox scrolling
+    def on_listbox_scroll(self, event):
+        if event.delta:
+            self.listbox.yview_scroll(int(-1*(event.delta/120)), "units")
+        elif event.num == 4:
+            self.listbox.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.listbox.yview_scroll(1, "units")
+
+    # Thread-safe method to update status label
+    def update_status(self, message):
+        self.status_label.after(0, lambda: self.status_label.config(text=message))
+
+    # Thread-safe method to update progress bar
+    def update_progress(self, value):
+        self.progress.after(0, lambda: self.progress.config(value=value))
+
+    # Populate the listbox with file names and dates
     def populate_listbox(self):
-        for idx, (filename, _, _) in enumerate(self.images):
+        for idx, (filename, _, datetime_taken) in enumerate(self.images):
+            # Format date/time for display
+            date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S')
             if filename in self.eye_positions:
-                self.listbox.insert(tk.END, f"{filename} ✅")
+                self.listbox.insert(tk.END, f"{filename} ({date_str}) ✅")
             else:
-                self.listbox.insert(tk.END, f"{filename} ⏳")
+                self.listbox.insert(tk.END, f"{filename} ({date_str}) ⏳")
 
     # Background thread to process images for pupil detection
     def process_images_in_background(self):
-        for idx, (filename, image, _) in enumerate(self.images):
+        total_images = len(self.images)
+        self.progress['maximum'] = total_images
+        for idx, (filename, image, datetime_taken) in enumerate(self.images):
+            self.update_status(f"Processing image {idx + 1}/{total_images}: {filename}")
+            self.update_progress(idx + 1)
             if filename not in self.eye_positions:
                 left_pupil, right_pupil = detect_pupils_with_preprocessing(image)
                 if left_pupil != (0, 0) and right_pupil != (0, 0):
-                    save_eye_positions(filename, left_pupil, right_pupil)
-                    self.eye_positions[filename] = [left_pupil, right_pupil]
+                    save_eye_positions(filename, left_pupil, right_pupil, datetime_taken)
+                    self.eye_positions[filename] = {
+                        'pupils': [left_pupil, right_pupil],
+                        'datetime_taken': datetime_taken
+                    }
                     self.update_listbox_item(idx, filename, True)
                 else:
                     self.update_listbox_item(idx, filename, False)
+        self.update_status("Processing complete.")
+        self.update_progress(0)
 
     # Update a specific item in the listbox (success or failure)
     def update_listbox_item(self, index, filename, success):
+        datetime_taken = self.images[index][2]
+        date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S')
         status_icon = "✅" if success else "❌"
-        new_text = f"{filename} {status_icon}"
+        new_text = f"{filename} ({date_str}) {status_icon}"
         self.listbox.delete(index)
         self.listbox.insert(index, new_text)
+
+    # Load and display image at a specific index
+    def show_image_at_index(self, index):
+        if index < 0 or index >= len(self.images):
+            return
+        self.current_image_index = index
+        filename, image, _ = self.images[index]
+        self.current_image = image  # Store original image
+        self.zoom_scale = 1.0  # Reset zoom scale when a new image is selected
+        self.pan_x = 0
+        self.pan_y = 0
+        self.clicks = []  # Reset clicks when a new image is selected
+        self.first_click_marker = None  # Reset first click marker
+        pupil_data = self.eye_positions.get(filename, None)
+        pupil_positions = pupil_data['pupils'] if pupil_data else None
+
+        self.display_image(image, pupil_positions)
+        # Update listbox selection
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(index)
+        self.listbox.activate(index)
+        self.listbox.see(index)
+
+    # Show previous image
+    def show_previous_image(self):
+        if self.current_image_index is not None and self.current_image_index > 0:
+            self.show_image_at_index(self.current_image_index - 1)
+
+    # Show next image
+    def show_next_image(self):
+        if self.current_image_index is not None and self.current_image_index < len(self.images) - 1:
+            self.show_image_at_index(self.current_image_index + 1)
 
     # Load and display selected image on the right pane
     def on_image_select(self, event):
         selection = event.widget.curselection()
         if not selection:
             return
-
         index = selection[0]
-        self.current_image_index = index
-        filename, image, _ = self.images[index]
-        pupil_positions = self.eye_positions.get(filename, None)
-
-        self.display_image(image, pupil_positions)
+        self.show_image_at_index(index)
 
     # Display image on canvas and draw pupils
     def display_image(self, image, pupil_positions):
-        original_height, original_width = image.shape[:2]
+        self.canvas.delete("all")
+
+        # Resize image according to zoom scale
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
-        resized_pil_image, scale_factor_w, scale_factor_h = self.resize_image(pil_image, self.canvas.winfo_width(), self.canvas.winfo_height())
-        self.current_image = ImageTk.PhotoImage(resized_pil_image)
 
-        # Clear previous drawings
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.current_image)
+        zoomed_width = int(pil_image.width * self.zoom_scale)
+        zoomed_height = int(pil_image.height * self.zoom_scale)
 
+        self.display_image_width = zoomed_width
+        self.display_image_height = zoomed_height
+
+        pil_image = pil_image.resize((zoomed_width, zoomed_height), Image.LANCZOS)
+        self.tk_image = ImageTk.PhotoImage(pil_image)
+
+        # Calculate offsets for panning
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        # Center the image initially
+        self.offset_x = (canvas_width - zoomed_width) // 2 + self.pan_x
+        self.offset_y = (canvas_height - zoomed_height) // 2 + self.pan_y
+
+        self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.tk_image)
+
+        # Update scaling factors
+        self.scale_factor_w = (zoomed_width / image.shape[1])
+        self.scale_factor_h = (zoomed_height / image.shape[0])
+
+        # Draw pupils
         if pupil_positions:
             left_pupil, right_pupil = pupil_positions
-            left_pupil_scaled = (int(left_pupil[0] * scale_factor_w), int(left_pupil[1] * scale_factor_h))
-            right_pupil_scaled = (int(right_pupil[0] * scale_factor_w), int(right_pupil[1] * scale_factor_h))
 
-            self.canvas.create_oval(left_pupil_scaled[0] - 2, left_pupil_scaled[1] - 2,
-                                    left_pupil_scaled[0] + 2, left_pupil_scaled[1] + 2,
-                                    outline="yellow", width=2)
-            self.canvas.create_oval(right_pupil_scaled[0] - 2, right_pupil_scaled[1] - 2,
-                                    right_pupil_scaled[0] + 2, right_pupil_scaled[1] + 2,
-                                    outline="yellow", width=2)
+            # Map pupil positions to canvas coordinates
+            left_pupil_canvas_x = left_pupil[0] * self.scale_factor_w + self.offset_x
+            left_pupil_canvas_y = left_pupil[1] * self.scale_factor_h + self.offset_y
+            right_pupil_canvas_x = right_pupil[0] * self.scale_factor_w + self.offset_x
+            right_pupil_canvas_y = right_pupil[1] * self.scale_factor_h + self.offset_y
 
-    # Resize image to fit the canvas while keeping the aspect ratio
-    def resize_image(self, image, canvas_width, canvas_height):
-        image_width, image_height = image.size
-        ratio = min(canvas_width / image_width, canvas_height / image_height)
-        new_size = (int(image_width * ratio), int(image_height * ratio))
-        resized_image = image.resize(new_size, Image.LANCZOS)
-        return resized_image, ratio, ratio
+            # Draw circles on the canvas
+            self.canvas.create_oval(
+                left_pupil_canvas_x - 2, left_pupil_canvas_y - 2,
+                left_pupil_canvas_x + 2, left_pupil_canvas_y + 2,
+                outline="yellow", width=2
+            )
+            self.canvas.create_oval(
+                right_pupil_canvas_x - 2, right_pupil_canvas_y - 2,
+                right_pupil_canvas_x + 2, right_pupil_canvas_y + 2,
+                outline="yellow", width=2
+            )
 
-    # Handle mouse click on canvas for manual eye selection
-    def on_canvas_click(self, event):
+        # If first click marker exists, redraw it
+        if self.clicks:
+            first_click = self.clicks[0]
+            first_click_canvas_x = first_click[0] * self.scale_factor_w + self.offset_x
+            first_click_canvas_y = first_click[1] * self.scale_factor_h + self.offset_y
+            self.canvas.create_oval(
+                first_click_canvas_x - 2, first_click_canvas_y - 2,
+                first_click_canvas_x + 2, first_click_canvas_y + 2,
+                outline="red", width=2
+            )
+
+    # Handle window resize event to adjust image display
+    def on_canvas_resize(self, event):
+        if self.current_image_index is not None:
+            filename, image, _ = self.images[self.current_image_index]
+            pupil_data = self.eye_positions.get(filename, None)
+            pupil_positions = pupil_data['pupils'] if pupil_data else None
+            self.display_image(self.current_image, pupil_positions)
+
+    # Handle mouse wheel events for zooming
+    def on_mouse_wheel(self, event):
         if self.current_image_index is None:
             return
 
+        # Get mouse position relative to canvas
+        mouse_x = self.canvas.canvasx(event.x)
+        mouse_y = self.canvas.canvasy(event.y)
+
+        # Windows and macOS
+        if event.delta:
+            delta = event.delta
+            if self.is_windows or self.is_mac:
+                delta = event.delta / 120  # Normalize delta to ±1 per scroll notch
+        # Linux (event.num is 4 or 5)
+        elif hasattr(event, 'num'):
+            if event.num == 4:
+                delta = 1
+            elif event.num == 5:
+                delta = -1
+            else:
+                delta = 0
+        else:
+            delta = 0
+
+        # Calculate zoom factor
+        if delta > 0:
+            zoom_factor = 1.1 ** delta
+        elif delta < 0:
+            zoom_factor = 1 / (1.1 ** abs(delta))
+        else:
+            zoom_factor = 1
+
+        # Limit zoom scale
+        new_zoom_scale = self.zoom_scale * zoom_factor
+        if new_zoom_scale < 0.1 or new_zoom_scale > 10:
+            return
+        self.zoom_scale = new_zoom_scale
+
+        # Adjust pan to keep the image centered around the mouse pointer
+        self.pan_x = (self.pan_x - mouse_x) * zoom_factor + mouse_x
+        self.pan_y = (self.pan_y - mouse_y) * zoom_factor + mouse_y
+
+        filename, image, _ = self.images[self.current_image_index]
+        pupil_data = self.eye_positions.get(filename, None)
+        pupil_positions = pupil_data['pupils'] if pupil_data else None
+        self.display_image(self.current_image, pupil_positions)
+
+    # Handle mouse button press for panning and pupil selection
+    def on_button_press(self, event):
+        if self.current_image_index is None:
+            return
+
+        self.start_x = event.x
+        self.start_y = event.y
+
+        # Check if shift key is pressed for selection
+        if event.state & 0x0001:  # Shift key
+            self.is_panning = False
+            self.handle_pupil_selection(event)
+        else:
+            self.is_panning = True
+            self.pan_start_x = event.x
+            self.pan_start_y = event.y
+
+    # Handle mouse dragging for panning
+    def on_mouse_drag(self, event):
+        if self.current_image_index is None or not self.is_panning:
+            return
+
+        dx = event.x - self.pan_start_x
+        dy = event.y - self.pan_start_y
+
+        self.pan_x += dx
+        self.pan_y += dy
+
+        self.pan_start_x = event.x
+        self.pan_start_y = event.y
+
+        filename, image, _ = self.images[self.current_image_index]
+        pupil_data = self.eye_positions.get(filename, None)
+        pupil_positions = pupil_data['pupils'] if pupil_data else None
+        self.display_image(self.current_image, pupil_positions)
+
+    # Handle mouse button release
+    def on_button_release(self, event):
+        if self.current_image_index is None:
+            return
+        if self.is_panning:
+            self.is_panning = False
+
+    # Handle pupil selection when shift key is pressed
+    def handle_pupil_selection(self, event):
+        # Calculate coordinates relative to the displayed image
         clicked_x = event.x
         clicked_y = event.y
-        _, scale_factor_w, scale_factor_h = self.resize_image(Image.fromarray(self.images[self.current_image_index][1]),
-                                                              self.canvas.winfo_width(), self.canvas.winfo_height())
 
-        original_x = int(clicked_x / scale_factor_w)
-        original_y = int(clicked_y / scale_factor_h)
-        self.clicks.append((original_x, original_y))
+        image_x = (clicked_x - self.offset_x) / self.scale_factor_w
+        image_y = (clicked_y - self.offset_y) / self.scale_factor_h
 
-        if len(self.clicks) == 2:
-            left_pupil, right_pupil = self.clicks
-            filename = self.images[self.current_image_index][0]
-            save_eye_positions(filename, left_pupil, right_pupil)
-            self.eye_positions[filename] = [left_pupil, right_pupil]
-            self.display_image(self.images[self.current_image_index][1], self.eye_positions[filename])
-            self.update_listbox_item(self.current_image_index, filename, True)
-            self.clicks = []
+        if 0 <= image_x <= self.current_image.shape[1] and 0 <= image_y <= self.current_image.shape[0]:
+            self.clicks.append((int(image_x), int(image_y)))
+
+            if len(self.clicks) == 1:
+                # Draw a visual prompt at the first click location
+                filename = self.images[self.current_image_index][0]
+                pupil_data = self.eye_positions.get(filename, None)
+                pupil_positions = pupil_data['pupils'] if pupil_data else None
+                self.display_image(self.current_image, pupil_positions)
+            elif len(self.clicks) == 2:
+                left_pupil, right_pupil = self.clicks
+                filename = self.images[self.current_image_index][0]
+                datetime_taken = self.images[self.current_image_index][2]
+                save_eye_positions(filename, left_pupil, right_pupil, datetime_taken)
+                self.eye_positions[filename] = {
+                    'pupils': [left_pupil, right_pupil],
+                    'datetime_taken': datetime_taken
+                }
+                pupil_positions = [left_pupil, right_pupil]
+                self.display_image(self.current_image, pupil_positions)
+                self.update_listbox_item(self.current_image_index, filename, True)
+                self.clicks = []
+                self.first_click_marker = None  # Remove the first click marker
 
     # Handle window close to save size, position, and last folder
     def on_close(self):
