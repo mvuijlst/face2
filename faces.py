@@ -1,26 +1,31 @@
 import os
 import cv2
-import dlib
-import numpy as np
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ExifTags
 import sqlite3
-from imutils import face_utils
 import platform
 import datetime
-import tkinter.ttk as ttk  # For progress bar
-
-# Initialize Dlib's face detector and predictor
-detector = dlib.get_frontal_face_detector()
-try:
-    predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
-except RuntimeError:
-    messagebox.showerror("Error", "Shape predictor file not found!")
-    quit()
 
 DB_FILE = "app_data.db"
+
+# Function to parse Unix timestamp from filename
+def get_datetime_from_filename(filename):
+    try:
+        # Extract the base filename without extension
+        base_name = os.path.splitext(filename)[0]
+        # Try to parse as integer timestamp
+        timestamp = int(base_name)
+        # Convert timestamp to datetime
+        datetime_obj = datetime.datetime.fromtimestamp(timestamp)
+        # Only consider dates after 2010
+        if datetime_obj.year >= 2010:
+            return datetime_obj
+        else:
+            return None
+    except (ValueError, OSError, OverflowError):
+        return None
 
 # Function to extract date/time from EXIF metadata
 def get_image_datetime(file_path):
@@ -53,13 +58,8 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS eye_positions
                  (filename TEXT PRIMARY KEY,
                   left_pupil_x INTEGER, left_pupil_y INTEGER,
-                  right_pupil_x INTEGER, right_pupil_y INTEGER)''')
-
-    # Check if datetime_taken column exists
-    c.execute("PRAGMA table_info(eye_positions)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'datetime_taken' not in columns:
-        c.execute("ALTER TABLE eye_positions ADD COLUMN datetime_taken TEXT")
+                  right_pupil_x INTEGER, right_pupil_y INTEGER,
+                  datetime_taken TEXT)''')
 
     conn.commit()
     conn.close()
@@ -92,17 +92,17 @@ def load_eye_positions():
     for row in c.fetchall():
         filename, left_x, left_y, right_x, right_y, datetime_taken = row
         # Ensure that coordinates are integers
-        left_x = int(left_x)
-        left_y = int(left_y)
-        right_x = int(right_x)
-        right_y = int(right_y)
+        left_x = int(left_x) if left_x is not None else None
+        left_y = int(left_y) if left_y is not None else None
+        right_x = int(right_x) if right_x is not None else None
+        right_y = int(right_y) if right_y is not None else None
         # Convert datetime string to datetime object
         if datetime_taken:
             datetime_taken = datetime.datetime.strptime(datetime_taken, '%Y-%m-%d %H:%M:%S')
         else:
             datetime_taken = None
         eye_positions[filename] = {
-            'pupils': [(left_x, left_y), (right_x, right_y)],
+            'pupils': [(left_x, left_y), (right_x, right_y)] if left_x is not None and right_x is not None else None,
             'datetime_taken': datetime_taken
         }
     conn.close()
@@ -124,13 +124,19 @@ def save_eye_positions(filename, left_pupil, right_pupil, datetime_taken):
 # Load all images from a folder and sort by date/time taken
 def load_images(folder):
     images = []
-    for filename in os.listdir(folder):
+    file_list = os.listdir(folder)
+    total_files = len(file_list)
+    for idx, filename in enumerate(file_list):
         if filename.lower().endswith((".jpg", ".png", ".jpeg")):
             file_path = os.path.join(folder, filename)
+            print(f"Loading image {idx+1}/{total_files}: {filename}")
             img_cv = cv2.imread(file_path)
             if img_cv is not None:
-                # Extract date/time from EXIF metadata
-                datetime_taken = get_image_datetime(file_path)
+                # Prefer date/time from filename if possible
+                datetime_taken = get_datetime_from_filename(filename)
+                if datetime_taken is None:
+                    # Extract date/time from EXIF metadata
+                    datetime_taken = get_image_datetime(file_path)
                 # If EXIF data is not available, use file modification time
                 if datetime_taken is None:
                     mod_time = os.path.getmtime(file_path)
@@ -138,73 +144,34 @@ def load_images(folder):
                 images.append((filename, img_cv, datetime_taken))
             else:
                 print(f"Skipping file {filename} due to loading error.")
+        else:
+            print(f"Skipping non-image file {filename}")
     # Sort images by date/time taken
     images.sort(key=lambda x: x[2])
     return images
 
-# Pupil detection functions
-def detect_pupils_with_preprocessing(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = detector(gray, 1)
-
-    if len(faces) == 0:
-        return (0, 0), (0, 0)
-
-    largest_face = max(faces, key=lambda rect: rect.width() * rect.height())
-    landmarks = predictor(gray, largest_face)
-    landmarks = face_utils.shape_to_np(landmarks)
-
-    # Extract the eye landmarks
-    left_eye_landmarks = landmarks[36:42]
-    right_eye_landmarks = landmarks[42:48]
-
-    # Extract and preprocess eye regions
-    left_eye_region = extract_eye_region(gray, left_eye_landmarks)
-    right_eye_region = extract_eye_region(gray, right_eye_landmarks)
-
-    left_eye_region = preprocess_eye(left_eye_region)
-    right_eye_region = preprocess_eye(right_eye_region)
-
-    # Detect pupils
-    left_pupil = detect_pupil_in_eye(left_eye_region)
-    right_pupil = detect_pupil_in_eye(right_eye_region)
-
-    # Convert to global coordinates
-    left_pupil_global = convert_to_global_coords(left_pupil, left_eye_landmarks)
-    right_pupil_global = convert_to_global_coords(right_pupil, right_eye_landmarks)
-
-    return left_pupil_global, right_pupil_global
-
-def extract_eye_region(gray_image, eye_landmarks):
-    x_min = min(eye_landmarks[:, 0])
-    x_max = max(eye_landmarks[:, 0])
-    y_min = min(eye_landmarks[:, 1])
-    y_max = max(eye_landmarks[:, 1])
-    return gray_image[y_min:y_max, x_min:x_max]
-
-def preprocess_eye(eye_region):
-    eye_preprocessed = cv2.equalizeHist(eye_region)
-    return eye_preprocessed
-
-def detect_pupil_in_eye(eye_region):
-    _, thresh = cv2.threshold(eye_region, 30, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(contours) == 0:
-        return (0, 0)
-    largest_contour = max(contours, key=cv2.contourArea)
-    M = cv2.moments(largest_contour)
-    if M['m00'] == 0:
-        return (0, 0)
-    cx = int(M['m10'] / M['m00'])
-    cy = int(M['m01'] / M['m00'])
-    return (cx, cy)
-
-def convert_to_global_coords(pupil_position, eye_landmarks):
-    x_min = min(eye_landmarks[:, 0])
-    y_min = min(eye_landmarks[:, 1])
-    global_x = pupil_position[0] + x_min
-    global_y = pupil_position[1] + y_min
-    return (global_x, global_y)
+# Update datetime_taken in the database if filename provides a better date
+def update_database_dates(eye_positions):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    updated = False
+    total_files = len(eye_positions)
+    for idx, filename in enumerate(eye_positions):
+        print(f"Checking date for {idx+1}/{total_files}: {filename}")
+        # Get datetime from filename
+        datetime_from_filename = get_datetime_from_filename(filename)
+        if datetime_from_filename:
+            # Check if current datetime_taken is different
+            current_datetime = eye_positions[filename]['datetime_taken']
+            if current_datetime != datetime_from_filename:
+                datetime_str = datetime_from_filename.strftime('%Y-%m-%d %H:%M:%S')
+                c.execute('''UPDATE eye_positions SET datetime_taken = ?
+                             WHERE filename = ?''', (datetime_str, filename))
+                eye_positions[filename]['datetime_taken'] = datetime_from_filename
+                updated = True
+    if updated:
+        conn.commit()
+    conn.close()
 
 # GUI Application for reviewing and correcting eye detection
 class EyeReviewApp:
@@ -234,11 +201,15 @@ class EyeReviewApp:
                 self.master.quit()
 
         # Load images and eye positions
+        print("Loading images...")
         self.images = load_images(self.folder_path)
+        print("Loading eye positions from database...")
         self.eye_positions = load_eye_positions()
 
-        self.detection_results = [None] * len(self.images)
-        self.manual_corrections = [False] * len(self.images)
+        # Update database dates based on filename if applicable
+        print("Updating database dates based on filenames...")
+        update_database_dates(self.eye_positions)
+
         self.current_image_index = None
         self.clicks = []
 
@@ -252,7 +223,7 @@ class EyeReviewApp:
         self.pan_start_x = 0
         self.pan_start_y = 0
 
-        # Left pane - Listbox for image list with detection status
+        # Left pane - Listbox for image list with status
         self.listbox_frame = tk.Frame(master)
         self.listbox_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
 
@@ -297,18 +268,13 @@ class EyeReviewApp:
         self.next_button = tk.Button(nav_frame, text="Next", command=self.show_next_image)
         self.next_button.pack(side=tk.LEFT, padx=5, pady=5)
 
-        # Add status label and progress bar
+        # Add status label
         self.status_label = tk.Label(master, text="Ready")
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.progress = ttk.Progressbar(master, orient=tk.HORIZONTAL, length=100, mode='determinate')
-        self.progress.pack(side=tk.BOTTOM, fill=tk.X)
-
         # Populate listbox with file names and dates
+        print("Populating listbox...")
         self.populate_listbox()
-
-        # Start background processing for pupil detection
-        threading.Thread(target=self.process_images_in_background, daemon=True).start()
 
         # Bind arrow keys for navigation
         self.master.bind('<Left>', lambda event: self.show_previous_image())
@@ -332,46 +298,22 @@ class EyeReviewApp:
     def update_status(self, message):
         self.status_label.after(0, lambda: self.status_label.config(text=message))
 
-    # Thread-safe method to update progress bar
-    def update_progress(self, value):
-        self.progress.after(0, lambda: self.progress.config(value=value))
-
     # Populate the listbox with file names and dates
     def populate_listbox(self):
+        total_images = len(self.images)
         for idx, (filename, _, datetime_taken) in enumerate(self.images):
+            print(f"Listing image {idx+1}/{total_images}: {filename}")
             # Format date/time for display
-            date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S')
-            if filename in self.eye_positions:
+            date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S') if datetime_taken else "Unknown Date"
+            if filename in self.eye_positions and self.eye_positions[filename]['pupils']:
                 self.listbox.insert(tk.END, f"{filename} ({date_str}) ✅")
             else:
-                self.listbox.insert(tk.END, f"{filename} ({date_str}) ⏳")
+                self.listbox.insert(tk.END, f"{filename} ({date_str}) ❌")
 
-    # Background thread to process images for pupil detection
-    def process_images_in_background(self):
-        total_images = len(self.images)
-        self.progress['maximum'] = total_images
-        for idx, (filename, image, datetime_taken) in enumerate(self.images):
-            self.update_status(f"Processing image {idx + 1}/{total_images}: {filename}")
-            self.update_progress(idx + 1)
-            if filename not in self.eye_positions:
-                left_pupil, right_pupil = detect_pupils_with_preprocessing(image)
-                if left_pupil != (0, 0) and right_pupil != (0, 0):
-                    save_eye_positions(filename, left_pupil, right_pupil, datetime_taken)
-                    self.eye_positions[filename] = {
-                        'pupils': [left_pupil, right_pupil],
-                        'datetime_taken': datetime_taken
-                    }
-                    self.update_listbox_item(idx, filename, True)
-                else:
-                    self.update_listbox_item(idx, filename, False)
-        self.update_status("Processing complete.")
-        self.update_progress(0)
-
-    # Update a specific item in the listbox (success or failure)
-    def update_listbox_item(self, index, filename, success):
+    # Update a specific item in the listbox (status icon)
+    def update_listbox_item(self, index, filename, status_icon):
         datetime_taken = self.images[index][2]
-        date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S')
-        status_icon = "✅" if success else "❌"
+        date_str = datetime_taken.strftime('%Y-%m-%d %H:%M:%S') if datetime_taken else "Unknown Date"
         new_text = f"{filename} ({date_str}) {status_icon}"
         self.listbox.delete(index)
         self.listbox.insert(index, new_text)
@@ -608,7 +550,7 @@ class EyeReviewApp:
                 }
                 pupil_positions = [left_pupil, right_pupil]
                 self.display_image(self.current_image, pupil_positions)
-                self.update_listbox_item(self.current_image_index, filename, True)
+                self.update_listbox_item(self.current_image_index, filename, "✅")
                 self.clicks = []
                 self.first_click_marker = None  # Remove the first click marker
 
