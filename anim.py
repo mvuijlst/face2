@@ -15,7 +15,7 @@ def rotate_and_pad(image, left_eye_pos, right_eye_pos, filename):
     h, w = image.shape[:2]
     
     # Controlled padding (limit to 20% of original size)
-    pad_size = int(max(h, w) * 0.2)
+    pad_size = int(max(h, w) * 0.01)
     padded_image = cv2.copyMakeBorder(image, pad_size, pad_size, pad_size, pad_size, cv2.BORDER_CONSTANT, value=[0, 0, 0])
     
     rotated_image = cv2.warpAffine(padded_image, M, (padded_image.shape[1], padded_image.shape[0]), flags=cv2.INTER_LINEAR)
@@ -65,9 +65,10 @@ def center_eyes(image, left_eye_pos, right_eye_pos, filename):
 
 
 
-# Step 3: Scale to maintain consistent eye distance, with sanity check on scaling factor
-def resize_to_eye_distance(image, left_eye_pos, right_eye_pos, target_eye_dist, filename):
-    current_eye_dist = np.sqrt((right_eye_pos[0] - left_eye_pos[0]) ** 2 + (right_eye_pos[1] - left_eye_pos[1]) ** 2)
+# Step 3: Scale to maintain consistent eye distance, using padded eye positions
+def resize_to_eye_distance(image, left_eye_pos_padded, right_eye_pos_padded, target_eye_dist, filename):
+    current_eye_dist = np.sqrt((right_eye_pos_padded[0] - left_eye_pos_padded[0]) ** 2 + 
+                               (right_eye_pos_padded[1] - left_eye_pos_padded[1]) ** 2)
     scale_factor = target_eye_dist / current_eye_dist
     
     # Ensure scale factor is reasonable (e.g., between 0.5x and 2x)
@@ -80,7 +81,9 @@ def resize_to_eye_distance(image, left_eye_pos, right_eye_pos, target_eye_dist, 
     # Debugging info
     print(f"\n{filename}: Resizing image. Current eye distance: {current_eye_dist:.2f}, target eye distance: {target_eye_dist:.2f}, scale factor: {scale_factor:.2f}")
     print(f"Image resized to {new_size[0]}x{new_size[1]}")
+    
     return resized_image
+
 
 # Step 4: Crop to 1080x1920 preserving aspect ratio
 def crop_to_target_size(image, target_size=(1080, 1920), filename=None):
@@ -131,16 +134,18 @@ def process_image(row, target_eye_dist, output_size, output_dir, index):
         centered_image = center_eyes(rotated_image, left_eye_pos_padded, right_eye_pos_padded, filename)
         cv2.imwrite(os.path.join(output_dir, f"debug_{index}_centered.jpg"), centered_image)
 
-        
         # Step 3: Resize to maintain consistent eye distance
-        resized_image = resize_to_eye_distance(centered_image, left_eye_pos, right_eye_pos, target_eye_dist, filename)
+        # Call resize_to_eye_distance with padded eye positions
+        resized_image = resize_to_eye_distance(centered_image, left_eye_pos_padded, right_eye_pos_padded, target_eye_dist, filename)
         cv2.imwrite(os.path.join(output_dir, f"debug_{index}_resized.jpg"), resized_image)
         
+        return resized_image, None
+    
         # Step 4: Crop to target size (1080x1920)
-        final_image = crop_to_target_size(resized_image, target_size=output_size, filename=filename)
-        cv2.imwrite(os.path.join(output_dir, f"debug_{index}_cropped.jpg"), final_image)
+        # final_image = crop_to_target_size(resized_image, target_size=output_size, filename=filename)
+        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_cropped.jpg"), final_image)
         
-        return final_image, None
+        # return final_image, None
     except Exception as e:
         return None, f"Error processing image {row['filename']}: {e}"
 
