@@ -15,7 +15,7 @@ def rotate_and_pad(image, left_eye_pos, right_eye_pos, filename):
     h, w = image.shape[:2]
     
     # Controlled padding (limit to 20% of original size)
-    pad_size = int(max(h, w) * 0.01)
+    pad_size = int(max(h, w) * 0.05)
     padded_image = cv2.copyMakeBorder(image, pad_size, pad_size, pad_size, pad_size, cv2.BORDER_CONSTANT, value=[0, 0, 0])
     
     rotated_image = cv2.warpAffine(padded_image, M, (padded_image.shape[1], padded_image.shape[0]), flags=cv2.INTER_LINEAR)
@@ -85,35 +85,6 @@ def resize_to_eye_distance(image, left_eye_pos_padded, right_eye_pos_padded, tar
     return resized_image
 
 
-# Step 4: Crop to 1080x1920 preserving aspect ratio
-def crop_to_target_size(image, target_size=(1080, 1920), filename=None):
-    h, w = image.shape[:2]
-    target_w, target_h = target_size
-    
-    aspect_ratio = w / h
-    target_aspect_ratio = target_w / target_h
-
-    if aspect_ratio > target_aspect_ratio:
-        # Image is wider than the target; crop the width
-        new_w = int(h * target_aspect_ratio)
-        start_x = max(0, (w - new_w) // 2)
-        cropped_image = image[:, start_x:start_x + new_w]
-        print(f"{filename}: Cropping width from {w} to {new_w}")
-    else:
-        # Image is taller than the target; crop the height
-        new_h = int(w / target_aspect_ratio)
-        start_y = max(0, (h - new_h) // 2)
-        cropped_image = image[start_y:start_y + new_h, :]
-        print(f"{filename}: Cropping height from {h} to {new_h}")
-    
-    # Final resize to target size if needed
-    cropped_image = cv2.resize(cropped_image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-    
-    # Save and print detailed debug information
-    print(f"{filename}: Final crop and resize to {target_w}x{target_h}")
-    return cropped_image
-
-
 # Processing pipeline for each image
 def process_image(row, target_eye_dist, output_size, output_dir, index):
     try:
@@ -128,11 +99,11 @@ def process_image(row, target_eye_dist, output_size, output_dir, index):
         
         # Step 1: Rotate and pad
         rotated_image, left_eye_pos_padded, right_eye_pos_padded = rotate_and_pad(image, left_eye_pos, right_eye_pos, filename)
-        cv2.imwrite(os.path.join(output_dir, f"debug_{index}_rotated.jpg"), rotated_image)
+        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_rotated.jpg"), rotated_image)
 
         # Step 2: Center the eyes (use the padded eye positions now)
         centered_image = center_eyes(rotated_image, left_eye_pos_padded, right_eye_pos_padded, filename)
-        cv2.imwrite(os.path.join(output_dir, f"debug_{index}_centered.jpg"), centered_image)
+        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_centered.jpg"), centered_image)
 
         # Step 3: Resize to maintain consistent eye distance
         # Call resize_to_eye_distance with padded eye positions
@@ -140,12 +111,7 @@ def process_image(row, target_eye_dist, output_size, output_dir, index):
         cv2.imwrite(os.path.join(output_dir, f"debug_{index}_resized.jpg"), resized_image)
         
         return resized_image, None
-    
-        # Step 4: Crop to target size (1080x1920)
-        # final_image = crop_to_target_size(resized_image, target_size=output_size, filename=filename)
-        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_cropped.jpg"), final_image)
-        
-        # return final_image, None
+            
     except Exception as e:
         return None, f"Error processing image {row['filename']}: {e}"
 
@@ -160,9 +126,6 @@ def main():
     conn = sqlite3.connect('app_data.db')
     df = pd.read_sql_query("SELECT * FROM eye_positions ORDER BY datetime_taken", conn)
     conn.close()
-
-    # For debugging, only process the first 5 images
-    df = df.head(5)
 
     # Calculate the maximum eye distance across all images
     df['eye_dist'] = np.sqrt((df['right_pupil_x'] - df['left_pupil_x']) ** 2 + (df['right_pupil_y'] - df['left_pupil_y']) ** 2)
