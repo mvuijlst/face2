@@ -3,6 +3,7 @@ import cv2
 import pandas as pd
 import numpy as np
 import os
+import subprocess
 
 # Step 1: Rotate image, keeping the eyes horizontal and padding to avoid cropping
 def rotate_and_pad(image, left_eye_pos, right_eye_pos, filename):
@@ -28,9 +29,9 @@ def rotate_and_pad(image, left_eye_pos, right_eye_pos, filename):
     
     # Save and print detailed debug information
     print(f"\n{filename}: Rotating image by {angle:.2f} degrees.")
-    print(f"Image dimensions before padding: {w}x{h}, after padding: {rotated_image.shape[1]}x{rotated_image.shape[0]}")
-    print(f"Padding applied: {pad_size}px on all sides.")
-    print(f"Eye center after padding: {eye_center_padded}")
+    #print(f"Image dimensions before padding: {w}x{h}, after padding: {rotated_image.shape[1]}x{rotated_image.shape[0]}")
+    #print(f"Padding applied: {pad_size}px on all sides.")
+    #print(f"Eye center after padding: {eye_center_padded}")
 
     # Return two values: the rotated image and the adjusted (padded) eye positions
     return rotated_image, left_eye_pos_padded, right_eye_pos_padded
@@ -57,9 +58,9 @@ def center_eyes(image, left_eye_pos, right_eye_pos, filename):
     centered_image = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
 
     # Save and print detailed debug information
-    print(f"Eye center before translation: {eye_center}, Image center: {image_center}")
-    print(f"Translation needed to center eyes: Δx={delta_x}, Δy={delta_y}")
-    print(f"New eye center should be at image center.")
+    #print(f"Eye center before translation: {eye_center}, Image center: {image_center}")
+    #print(f"Translation needed to center eyes: Δx={delta_x}, Δy={delta_y}")
+    #print(f"New eye center should be at image center.")
 
     return centered_image
 
@@ -79,14 +80,14 @@ def resize_to_eye_distance(image, left_eye_pos_padded, right_eye_pos_padded, tar
     resized_image = cv2.resize(image, new_size, interpolation=cv2.INTER_LINEAR)
     
     # Debugging info
-    print(f"\n{filename}: Resizing image. Current eye distance: {current_eye_dist:.2f}, target eye distance: {target_eye_dist:.2f}, scale factor: {scale_factor:.2f}")
-    print(f"Image resized to {new_size[0]}x{new_size[1]}")
+    #print(f"\n{filename}: Resizing image. Current eye distance: {current_eye_dist:.2f}, target eye distance: {target_eye_dist:.2f}, scale factor: {scale_factor:.2f}")
+    #print(f"Image resized to {new_size[0]}x{new_size[1]}")
     
     return resized_image
 
 
 # Processing pipeline for each image
-def process_image(row, target_eye_dist, output_size, output_dir, index):
+def process_image(row, target_eye_dist, output_dir, index):
     try:
         image_path = f"./photos/{row['filename']}"
         image = cv2.imread(image_path)
@@ -99,44 +100,80 @@ def process_image(row, target_eye_dist, output_size, output_dir, index):
         
         # Step 1: Rotate and pad
         rotated_image, left_eye_pos_padded, right_eye_pos_padded = rotate_and_pad(image, left_eye_pos, right_eye_pos, filename)
-        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_rotated.jpg"), rotated_image)
-
+    
         # Step 2: Center the eyes (use the padded eye positions now)
         centered_image = center_eyes(rotated_image, left_eye_pos_padded, right_eye_pos_padded, filename)
-        # cv2.imwrite(os.path.join(output_dir, f"debug_{index}_centered.jpg"), centered_image)
-
+    
         # Step 3: Resize to maintain consistent eye distance
-        # Call resize_to_eye_distance with padded eye positions
         resized_image = resize_to_eye_distance(centered_image, left_eye_pos_padded, right_eye_pos_padded, target_eye_dist, filename)
-        cv2.imwrite(os.path.join(output_dir, f"debug_{index}_resized.jpg"), resized_image)
-        
+    
+        # Save the final image with a sequential filename
+        output_filename = os.path.join(output_dir, f"frame_{index:05d}.jpg")
+        cv2.imwrite(output_filename, resized_image)
+    
+        # Return the image and its dimensions
         return resized_image, None
-            
+                
     except Exception as e:
         return None, f"Error processing image {row['filename']}: {e}"
 
+def create_movie(output_dir, max_width, max_height):
+    input_pattern = os.path.join(output_dir, 'frame_%05d.jpg')
+    output_movie = 'output_movie.mp4'
+    
+    # FFmpeg command to pad images to max dimensions and create the video
+    cmd = [
+        'ffmpeg',
+        '-y',  # Overwrite output file if it exists
+        '-framerate', '30',
+        '-i', input_pattern,
+        '-vf', f'pad={max_width}:{max_height}:(ow-iw)/2:(oh-ih)/2',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        output_movie
+    ]
+    print('\nRunning FFmpeg command:')
+    print(' '.join(cmd))
+    subprocess.run(cmd)
+
 def main():
-    output_size = (1080, 1920)  # Output portrait resolution (1080x1920)
     output_dir = './intermediate_images'
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
+    
     # Connect to the SQLite database and retrieve eye positions
     conn = sqlite3.connect('app_data.db')
     df = pd.read_sql_query("SELECT * FROM eye_positions ORDER BY datetime_taken", conn)
     conn.close()
-
+    
+    # Limit to the first 50 images
+    # df = df.head(50)
+    
     # Calculate the maximum eye distance across all images
     df['eye_dist'] = np.sqrt((df['right_pupil_x'] - df['left_pupil_x']) ** 2 + (df['right_pupil_y'] - df['left_pupil_y']) ** 2)
     target_eye_dist = df['eye_dist'].max()
-
-    # Process images sequentially for debugging
+    
+    # Process images and collect dimensions
+    max_width = 0
+    max_height = 0
     for index, row in df.iterrows():
         print(f"\nProcessing image {index + 1}/{len(df)}: {row['filename']}")
-        image, error = process_image(row, target_eye_dist, output_size, output_dir, index)
+        image, error = process_image(row, target_eye_dist, output_dir, index)
         if error:
             print(error)
+        else:
+            h, w = image.shape[:2]
+            #print(f"Processed image dimensions: width={w}, height={h}")
+            max_width = max(max_width, w)
+            max_height = max(max_height, h)
+    
+    print(f"\nMaximum dimensions among all images: width={max_width}, height={max_height}")
+
+    
+    # Create the movie using FFmpeg
+    create_movie(output_dir, max_width, max_height)
+
 
 if __name__ == "__main__":
     main()
